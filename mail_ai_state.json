@@ -1,4 +1,17 @@
 {
-  "accounts": {},
+  "accounts": {
+    "QQ": {
+      "last_ai_scan_ms": 1791339478641,
+      "seen": []
+    },
+    "Yahoo": {
+      "last_ai_scan_ms": 1791339472036,
+      "seen": []
+    },
+    "iCloud": {
+      "last_ai_scan_ms": 1791339468197,
+      "seen": []
+    }
+  },
   "version": 1
 }
