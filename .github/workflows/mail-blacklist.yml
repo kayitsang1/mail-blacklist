@@ -36,15 +36,29 @@ jobs:
           QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
           QQ_AUTH_CODE: ${{ secrets.QQ_AUTH_CODE }}
 
+          # Cloudflare Workers AI
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+
+          # Optional. Comma/newline-separated model override.
+          # Leave unset to use Gemma -> GLM -> Llama fallback.
+          CF_AI_MODELS: ${{ vars.CF_AI_MODELS }}
+
+          # Optional safety allowlists. Comma/newline/semicolon-separated.
+          AI_ALLOWLIST_SENDERS: ${{ secrets.AI_ALLOWLIST_SENDERS }}
+          AI_ALLOWLIST_DOMAINS: ${{ secrets.AI_ALLOWLIST_DOMAINS }}
+
         run: |
           python mail_blacklist.py
 
-      - name: Save updated blacklists
+      - name: Save updated blacklists and AI state
         run: |
-          FILES="icloud_blacklist.txt yahoo_blacklist.txt qq_blacklist.txt"
+          BLACKLIST_FILES="icloud_blacklist.txt yahoo_blacklist.txt qq_blacklist.txt"
+          STATE_FILE="mail_ai_state.json"
+          FILES="$BLACKLIST_FILES $STATE_FILE"
 
           if git diff --quiet -- $FILES; then
-            echo "Blacklists unchanged."
+            echo "Blacklists and AI state unchanged."
             exit 0
           fi
 
@@ -52,7 +66,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add $FILES
-          git commit -m "Update mail blacklists"
+          git commit -m "Update mail blacklists and AI state"
 
           for attempt in 1 2 3 4 5; do
             echo "Push attempt $attempt"
@@ -64,16 +78,22 @@ jobs:
 
               git rebase --abort
 
-              # 保留目前 Python 產生的三份 blacklist
-              cp icloud_blacklist.txt /tmp/icloud_blacklist.txt
-              cp yahoo_blacklist.txt /tmp/yahoo_blacklist.txt
-              cp qq_blacklist.txt /tmp/qq_blacklist.txt
+              # Preserve this run's generated blacklist/state files.
+              for file in $BLACKLIST_FILES; do
+                cp "$file" "/tmp/$file"
+              done
 
-              # 回到遠端最新 main
+              if [ -f "$STATE_FILE" ]; then
+                cp "$STATE_FILE" "/tmp/$STATE_FILE"
+              else
+                printf '{\n  "version": 1,\n  "accounts": {}\n}\n' > "/tmp/$STATE_FILE"
+              fi
+
+              # Return to the latest remote main.
               git reset --hard origin/main
 
-              # 把目前執行新學到的 blacklist 合併回來
-              for file in $FILES; do
+              # Merge blacklists as normalized unique email-address lines.
+              for file in $BLACKLIST_FILES; do
                 tmp="/tmp/$file"
 
                 touch "$file"
@@ -87,18 +107,76 @@ jobs:
                 mv "${file}.merged" "$file"
               done
 
+              # Merge the persistent AI UID state as JSON rather than as lines.
+              python - "$STATE_FILE" "/tmp/$STATE_FILE" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          current_path = Path(sys.argv[1])
+          incoming_path = Path(sys.argv[2])
+
+          def load(path):
+              try:
+                  data = json.loads(path.read_text(encoding="utf-8"))
+              except Exception:
+                  data = {}
+              if not isinstance(data, dict):
+                  data = {}
+              accounts = data.get("accounts")
+              if not isinstance(accounts, dict):
+                  accounts = {}
+              return accounts
+
+          current = load(current_path)
+          incoming = load(incoming_path)
+          merged = {}
+
+          for name in sorted(set(current) | set(incoming)):
+              a = current.get(name) if isinstance(current.get(name), dict) else {}
+              b = incoming.get(name) if isinstance(incoming.get(name), dict) else {}
+
+              last_scan = max(
+                  int(a.get("last_ai_scan_ms", 0) or 0),
+                  int(b.get("last_ai_scan_ms", 0) or 0),
+              )
+
+              seen = []
+              seen_set = set()
+              for item in list(a.get("seen", []) or []) + list(b.get("seen", []) or []):
+                  item = str(item)
+                  if item and item not in seen_set:
+                      seen_set.add(item)
+                      seen.append(item)
+
+              merged[name] = {
+                  "last_ai_scan_ms": last_scan,
+                  "seen": seen[-500:],
+              }
+
+          current_path.write_text(
+              json.dumps(
+                  {"version": 1, "accounts": merged},
+                  ensure_ascii=False,
+                  indent=2,
+                  sort_keys=True,
+              ) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
               git add $FILES
 
               if git diff --cached --quiet; then
-                echo "Remote already contains all blacklist updates."
+                echo "Remote already contains all blacklist/state updates."
                 exit 0
               fi
 
-              git commit -m "Merge mail blacklist updates"
+              git commit -m "Merge mail blacklist and AI state updates"
             fi
 
             if git push origin HEAD:main; then
-              echo "Blacklist updates pushed successfully."
+              echo "Blacklist/state updates pushed successfully."
               exit 0
             fi
 
@@ -106,5 +184,5 @@ jobs:
             sleep $((attempt * 2))
           done
 
-          echo "Unable to push blacklist updates after retries."
+          echo "Unable to push blacklist/state updates after retries."
           exit 1
