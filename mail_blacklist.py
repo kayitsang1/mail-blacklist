@@ -361,6 +361,27 @@ def get_uidvalidity(mail):
     return "unknown"
 
 
+def build_ai_model_payload(model, messages):
+    payload = {
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": 320,
+    }
+
+    # Gemma 4 and GLM-4.7-Flash can spend the output budget in their
+    # reasoning channel. This task only needs a short deterministic JSON
+    # classification, so explicitly disable thinking for those models.
+    if model in {
+        "@cf/google/gemma-4-26b-a4b-it",
+        "@cf/zai-org/glm-4.7-flash",
+    }:
+        payload["chat_template_kwargs"] = {
+            "enable_thinking": False,
+        }
+
+    return payload
+
+
 def cf_run_model_once(model, payload):
     account_id = os.environ.get("CF_ACCOUNT_ID", "").strip()
     token = os.environ.get("CF_API_TOKEN", "").strip()
@@ -463,13 +484,35 @@ def cf_run_model_once(model, payload):
             and choices
             and isinstance(choices[0], dict)
         ):
-            message = choices[0].get("message")
+            choice = choices[0]
+            message = choice.get("message")
 
-            if (
-                isinstance(message, dict)
-                and message.get("content") is not None
-            ):
-                return str(message.get("content"))
+            if isinstance(message, dict):
+                content = message.get("content")
+
+                if (
+                    isinstance(content, str)
+                    and content.strip()
+                ):
+                    return content
+
+                # Never treat the reasoning channel as the final decision.
+                # It can be incomplete when the completion budget is reached.
+                if (
+                    message.get("reasoning_content")
+                    or message.get("reasoning")
+                ):
+                    finish_reason = str(
+                        choice.get("finish_reason") or ""
+                    )
+                    raise RuntimeError(
+                        "Model returned reasoning without final content"
+                        + (
+                            f"; finish_reason={finish_reason}"
+                            if finish_reason
+                            else ""
+                        )
+                    )
 
     return json.dumps(result)
 
@@ -605,25 +648,26 @@ def classify_email_with_ai(account_name, message):
         )[:AI_BODY_MAX_CHARS],
     ])
 
-    payload = {
-        "messages": [
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": user_prompt,
-            },
-        ],
-        "temperature": 0,
-        "max_tokens": 220,
-    }
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt,
+        },
+        {
+            "role": "user",
+            "content": user_prompt,
+        },
+    ]
 
     last_error = None
 
     for model in ai_models():
         try:
+            payload = build_ai_model_payload(
+                model,
+                messages
+            )
+
             raw = cf_run_model_with_retry(
                 model,
                 payload
